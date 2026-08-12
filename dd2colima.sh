@@ -236,6 +236,13 @@ remove_colima_everything_and_exit() {
     fi
   fi
 
+  # 5b) Remove leftover Docker Desktop user socket (orphan; daemon not running).
+  # It otherwise becomes the CLI's default fallback and yields "Connection refused".
+  if [[ -S "$HOME/.docker/run/docker.sock" ]] && ! pgrep -f "Docker.app" >/dev/null 2>&1; then
+    warn "Removing orphan Docker Desktop socket ~/.docker/run/docker.sock..."
+    rm -f "$HOME/.docker/run/docker.sock" >/dev/null 2>&1 || true
+  fi
+
   # 6) Optionally uninstall Homebrew formulas colima/lima (keep docker CLI)
   if have brew; then
     warn "Uninstalling Homebrew formulas colima/lima (keeping Docker CLI)..."
@@ -436,7 +443,10 @@ if [[ "$REMOVE_DOCKER_DESKTOP" == "true" ]]; then
   safe_prune
 fi
 
-# Write static Colima config (non-interactive; no --edit)
+# Write static Colima config (non-interactive; no --edit).
+# NOTE: for an EXISTING VM, Colima ignores this file and keeps the values from
+# creation time. The resources below are enforced via explicit CLI flags on
+# `colima start`, which are the source of truth on (re)boot/creation.
 ok "Writing Colima config (profile=$PROFILE, arch=$ARCH, vmType=$VM_TYPE, mountType=$MOUNT_TYPE)..."
 mkdir -p "$HOME/.colima/$PROFILE"
 cat > "$HOME/.colima/$PROFILE/colima.yaml" <<EOF
@@ -448,8 +458,19 @@ vmType: ${VM_TYPE}
 mountType: ${MOUNT_TYPE}
 EOF
 
-ok "Starting Colima..."
-colima start --profile "$PROFILE" >/dev/null
+# Warn if a VM already exists with immutable/divergent settings.
+# arch/vmType/mountType cannot change after creation; disk can only grow.
+if have colima && colima status --profile "$PROFILE" >/dev/null 2>&1; then
+  warn "A Colima VM (profile=$PROFILE) already exists."
+  warn "  - cpu/memory: will be applied now via 'colima start' flags."
+  warn "  - disk: can only GROW (Colima cannot shrink it); requesting a smaller value is ignored."
+  warn "  - arch/vmType/mountType: FIXED at creation; to change them run --remove-colima and migrate again."
+fi
+
+ok "Starting Colima (cpus=$CPU, memory=${MEM_GB}GB, disk=${DISK_GB}GB, vm-type=$VM_TYPE)..."
+colima start --profile "$PROFILE" \
+  --cpus "$CPU" --memory "$MEM_GB" --disk "$DISK_GB" \
+  --vm-type "$VM_TYPE" --mount-type "$MOUNT_TYPE" --arch "$ARCH" >/dev/null
 
 # Docker Desktop compatibility socket
 ok "Creating Docker Desktop-compatible socket: $SOCK_STD -> $SOCK_COLIMA (sudo may prompt)..."
