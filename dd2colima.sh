@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # -----------------------------------------------------------------------------
-# migrate-docker-desktop-to-colima.sh
+# dd2colima.sh
 #
 # Goal:
 #   Replace Docker Desktop with Colima on macOS while keeping maximum
@@ -17,6 +17,8 @@ set -euo pipefail
 # Modes:
 #   1) Migration mode (default):
 #        - installs/updates Colima + Docker CLI tools via Homebrew
+#        - shows the host CPU/RAM and prompts for VM resources
+#          (Enter accepts the suggested value; env overrides skip the prompt)
 #        - writes a static Colima config (no interactive editor)
 #        - starts Colima
 #        - creates /var/run/docker.sock symlink -> Colima socket
@@ -33,14 +35,25 @@ set -euo pipefail
 #        - removes /var/run/docker.sock only if it points to ~/.colima
 #        - optionally uninstalls Homebrew formulas colima/lima (keeps docker CLI)
 #
+#   3) Memory resize helper:
+#        --set-mem <GB>
+#        - adjusts the running VM's RAM to <GB> (integer) without a full
+#          re-migration: updates ~/.colima/<profile>/colima.yaml and restarts.
+#        - NOTE: with vmType "vz" (default on arm64) Colima/Lima does NOT return
+#          idle RAM to the host; the VM reserves whatever it is given while it
+#          runs. Keep RAM low (default 8 GB) and use this helper to raise it only
+#          when a heavy container workload needs it, so the rest stays free for
+#          local AI / other apps.
+#
 # Flags:
 #   --remove-colima
 #   --remove-docker-desktop
+#   --set-mem <GB>
 #
-# Optional environment overrides:
+# Optional environment overrides (set to skip the interactive prompt):
 #   COLIMA_PROFILE        (default: default)
-#   COLIMA_CPU            (default: 10)
-#   COLIMA_MEM_GB         (default: 12)
+#   COLIMA_CPU            (default: host CPUs - 4, min 2)
+#   COLIMA_MEM_GB         (default: 8)
 #   COLIMA_DISK_GB        (default: 100)
 #   COLIMA_VM_TYPE        (default: arm64->vz, intel->qemu)
 #   COLIMA_MOUNT_TYPE     (default: virtiofs)
@@ -48,13 +61,17 @@ set -euo pipefail
 
 REMOVE_DOCKER_DESKTOP="false"
 REMOVE_COLIMA="false"
+SET_MEM=""
 
-for arg in "${@:-}"; do
-  case "$arg" in
+while [[ $# -gt 0 ]]; do
+  case "$1" in
     --remove-docker-desktop) REMOVE_DOCKER_DESKTOP="true" ;;
     --remove-colima)         REMOVE_COLIMA="true" ;;
+    --set-mem)               SET_MEM="${2:-}"; shift ;;
+    --set-mem=*)             SET_MEM="${1#*=}" ;;
     *) ;;
   esac
+  shift
 done
 
 # -------------------------------
@@ -247,6 +264,102 @@ EOF
   exit 0
 }
 
+is_uint() {
+  # True when arg is a positive integer (>= 1)
+  [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]]
+}
+
+prompt_resources() {
+  # Resolve CPU / MEM_GB / DISK_GB into globals.
+  # Priority: explicit env override > interactive prompt > suggested default.
+  # Non-interactive (no TTY) or env-set values skip the prompt entirely.
+  local host_cpus host_mem_gb sug_cpu sug_mem sug_disk ans
+
+  host_cpus="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+  host_mem_gb="$(( $(sysctl -n hw.memsize 2>/dev/null || echo $((4*1024*1024*1024))) / 1024 / 1024 / 1024 ))"
+
+  # Suggested defaults (with safety floors)
+  sug_cpu=$(( host_cpus - 4 )); (( sug_cpu < 2 )) && sug_cpu=2
+  sug_mem=8                                        # keep RAM low for local AI / other apps
+  sug_disk=100
+
+  ok "Detected host: ${host_cpus} CPU, ${host_mem_gb} GB RAM (${HOST_ARCH})"
+  warn "Note: with vmType '${VM_TYPE}' the VM RESERVES its RAM while running (no reclaim to host)."
+  warn "      Keep memory modest; raise later on demand with:  $(basename "$0") --set-mem <GB>"
+
+  # If all three come from env, skip the prompt (automation / CI).
+  if [[ -n "${COLIMA_CPU:-}" && -n "${COLIMA_MEM_GB:-}" && -n "${COLIMA_DISK_GB:-}" ]]; then
+    CPU="$COLIMA_CPU"; MEM_GB="$COLIMA_MEM_GB"; DISK_GB="$COLIMA_DISK_GB"
+    ok "Using resources from environment: CPU=${CPU}, MEM=${MEM_GB}GB, DISK=${DISK_GB}GB"
+    return 0
+  fi
+
+  # Start from env value if present, else suggested.
+  CPU="${COLIMA_CPU:-$sug_cpu}"
+  MEM_GB="${COLIMA_MEM_GB:-$sug_mem}"
+  DISK_GB="${COLIMA_DISK_GB:-$sug_disk}"
+
+  # No TTY: accept suggested/env values without prompting.
+  if [[ ! -t 0 ]]; then
+    ok "Non-interactive shell; using CPU=${CPU}, MEM=${MEM_GB}GB, DISK=${DISK_GB}GB"
+    return 0
+  fi
+
+  # Interactive: ask each value; empty Enter accepts the shown default.
+  if [[ -z "${COLIMA_CPU:-}" ]]; then
+    read -r -p "CPU cores for the VM [${CPU}]: " ans || true
+    [[ -n "$ans" ]] && { is_uint "$ans" && CPU="$ans" || warn "Invalid value; keeping ${CPU}"; }
+  fi
+  if [[ -z "${COLIMA_MEM_GB:-}" ]]; then
+    read -r -p "Memory in GB for the VM [${MEM_GB}]: " ans || true
+    [[ -n "$ans" ]] && { is_uint "$ans" && MEM_GB="$ans" || warn "Invalid value; keeping ${MEM_GB}"; }
+  fi
+  if [[ -z "${COLIMA_DISK_GB:-}" ]]; then
+    read -r -p "Disk in GB for the VM [${DISK_GB}]: " ans || true
+    [[ -n "$ans" ]] && { is_uint "$ans" && DISK_GB="$ans" || warn "Invalid value; keeping ${DISK_GB}"; }
+  fi
+
+  ok "Selected resources: CPU=${CPU}, MEM=${MEM_GB}GB, DISK=${DISK_GB}GB"
+}
+
+resize_memory_and_exit() {
+  # Adjust the running VM's RAM to $SET_MEM (integer GB) and restart, without a
+  # full re-migration. Persists the value in colima.yaml.
+  local gb="$1"
+  local profile cfg
+  profile="${COLIMA_PROFILE:-default}"
+  cfg="$HOME/.colima/${profile}/colima.yaml"
+
+  is_uint "$gb" || die "--set-mem requires a positive integer (GB). Got: '${gb}'"
+  have colima   || die "Colima is not installed. Run the migration first."
+
+  if [[ -f "$cfg" ]]; then
+    cp -n "$cfg" "${cfg}.bak" 2>/dev/null || true
+    if grep -qE '^memory:' "$cfg"; then
+      perl -i -pe "s/^memory:.*\$/memory: ${gb}/" "$cfg" 2>/dev/null || true
+    else
+      printf 'memory: %s\n' "$gb" >> "$cfg"
+    fi
+  else
+    warn "Config $cfg not found; colima start will create it with the new memory."
+  fi
+
+  ok "Restarting Colima (profile=${profile}) with memory=${gb}GB..."
+  colima stop  --profile "$profile" >/dev/null 2>&1 || true
+  colima start --profile "$profile" --memory "$gb" >/dev/null
+
+  ok "Memory now set to: $(grep -E '^memory:' "$cfg" 2>/dev/null || echo "memory: ${gb}")"
+  docker version >/dev/null 2>&1 && ok "Docker daemon reachable." || warn "Docker not reachable yet; open a new terminal or check 'colima status'."
+  exit 0
+}
+
+# -------------------------------
+# Entry: memory resize helper
+# -------------------------------
+if [[ -n "$SET_MEM" ]]; then
+  resize_memory_and_exit "$SET_MEM"
+fi
+
 # -------------------------------
 # Entry: destructive reset mode
 # -------------------------------
@@ -261,23 +374,22 @@ have uname || die "uname is required"
 HOST_ARCH="$(uname -m || true)"
 
 PROFILE="${COLIMA_PROFILE:-default}"
-DISK_GB="${COLIMA_DISK_GB:-100}"
 MOUNT_TYPE="${COLIMA_MOUNT_TYPE:-virtiofs}"
 
 if [[ "$HOST_ARCH" == "arm64" ]]; then
   ARCH="aarch64"
   VM_TYPE="${COLIMA_VM_TYPE:-vz}"
-  CPU="${COLIMA_CPU:-10}"
-  MEM_GB="${COLIMA_MEM_GB:-12}"
 else
   ARCH="x86_64"
   VM_TYPE="${COLIMA_VM_TYPE:-qemu}"
-  CPU="${COLIMA_CPU:-10}"
-  MEM_GB="${COLIMA_MEM_GB:-12}"
 fi
+
+# Resolve CPU / MEM_GB / DISK_GB (env override > interactive prompt > suggested)
+prompt_resources
 
 SOCK_COLIMA="$HOME/.colima/${PROFILE}/docker.sock"
 SOCK_STD="/var/run/docker.sock"
+CONFIG="$HOME/.docker/config.json"
 
 have brew || die "Homebrew (brew) is required in migrate mode. Install it first and rerun."
 
@@ -394,6 +506,10 @@ Quick checks:
   docker context ls
   docker buildx ls
   docker version
+
+Adjust VM memory later (no re-migration; vz reserves RAM while running):
+  ./dd2colima.sh --set-mem 16   # raise to 16 GB for heavy container workloads
+  ./dd2colima.sh --set-mem 6    # lower to 6 GB to free RAM for local AI / other apps
 
 Buildx multi-arch test (run in a directory that contains a Dockerfile):
   docker buildx build --platform linux/amd64,linux/arm64 -t test/multiarch:dev . --load
